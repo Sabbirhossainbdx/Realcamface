@@ -13,7 +13,7 @@ To ensure smooth collaboration and maintain the high quality of our codebase, pl
     *   For large or potentially disruptive changes, use the `experimental` branch.
     *   This allows for thorough discussion and review before considering a merge into `main`.
 
-## Pre-Pull Request Checklist
+## Pre-Pull Request (PR) Checklist
 
 Before creating a Pull Request (PR), ensure you have completed the following tests:
 
