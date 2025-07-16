@@ -1,7 +1,10 @@
 <h1 align="center">Deep-Live-Cam</h1>
 
 <p align="center">
-  Real-time face swap and video deepfake with a single click and only a single image.This project is tested with BrowserStack
+This project is tested with BrowserStack
+
+<p align="center">
+  Real-time face swap and video deepfake with a single click and only a single image.
 </p>
 
 <p align="center">
