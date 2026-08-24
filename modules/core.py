@@ -2,7 +2,7 @@ import os
 import sys
 # single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
-    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['OMP_NUM_THREADS'] = '6'
 # reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
@@ -11,21 +11,30 @@ import platform
 import signal
 import shutil
 import argparse
-import torch
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 import onnxruntime
-import tensorflow
+try:
+    import tensorflow
+    HAS_TENSORFLOW = True
+except ImportError:
+    HAS_TENSORFLOW = False
 
 import modules.globals
 import modules.metadata
 import modules.ui as ui
-from modules.processors.frame.core import get_frame_processors_modules
+from modules.processors.frame.core import get_frame_processors_modules, process_video_in_memory
 from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
 
-if 'ROCMExecutionProvider' in modules.globals.execution_providers:
+if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
 
 warnings.filterwarnings('ignore', category=FutureWarning, module='insightface')
-warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
+if HAS_TORCH:
+    warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 
 
 def parse_args() -> None:
@@ -34,7 +43,7 @@ def parse_args() -> None:
     program.add_argument('-s', '--source', help='select an source image', dest='source_path')
     program.add_argument('-t', '--target', help='select an target image or video', dest='target_path')
     program.add_argument('-o', '--output', help='select output file or directory', dest='output_path')
-    program.add_argument('--frame-processor', help='pipeline of frame processors', dest='frame_processor', default=['face_swapper'], choices=['face_swapper', 'face_enhancer'], nargs='+')
+    program.add_argument('--frame-processor', help='pipeline of frame processors', dest='frame_processor', default=['face_swapper'], choices=['face_swapper', 'face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'], nargs='+')
     program.add_argument('--keep-fps', help='keep original fps', dest='keep_fps', action='store_true', default=False)
     program.add_argument('--keep-audio', help='keep original audio', dest='keep_audio', action='store_true', default=True)
     program.add_argument('--keep-frames', help='keep temporary frames', dest='keep_frames', action='store_true', default=False)
@@ -48,8 +57,8 @@ def parse_args() -> None:
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
-    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
-    program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
+    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
+    program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=None)
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
 
     # register deprecated args
@@ -81,11 +90,15 @@ def parse_args() -> None:
     modules.globals.execution_threads = args.execution_threads
     modules.globals.lang = args.lang
 
-    #for ENHANCER tumbler:
-    if 'face_enhancer' in args.frame_processor:
-        modules.globals.fp_ui['face_enhancer'] = True
-    else:
-        modules.globals.fp_ui['face_enhancer'] = False
+    # The argparse default (None) avoids evaluating suggest_execution_threads()
+    # before providers are decoded, and deprecated-arg overrides above may
+    # have already set execution_threads.
+    if modules.globals.execution_threads is None:
+        modules.globals.execution_threads = suggest_execution_threads()
+
+    #for ENHANCER tumblers:
+    for enhancer_key in ('face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'):
+        modules.globals.fp_ui[enhancer_key] = enhancer_key in args.frame_processor
 
     # translate deprecated args
     if args.source_path_deprecated:
@@ -124,28 +137,48 @@ def suggest_max_memory() -> int:
     return 16
 
 
+def suggest_default_execution_provider() -> str:
+    """Pick the best available provider: cuda > rocm > coreml > openvino > dml > cpu."""
+    available = encode_execution_providers(onnxruntime.get_available_providers())
+    for pref in ('cuda', 'rocm', 'coreml', 'openvino', 'dml'):
+        if pref in available:
+            return pref
+    return 'cpu'
+
+
 def suggest_execution_providers() -> List[str]:
     return encode_execution_providers(onnxruntime.get_available_providers())
 
 
 def suggest_execution_threads() -> int:
+    """Suggest optimal thread count based on hardware and execution provider."""
+    import os
+    
+    # Get CPU count
+    cpu_count = os.cpu_count() or 4
+    
     if 'DmlExecutionProvider' in modules.globals.execution_providers:
         return 1
     if 'ROCMExecutionProvider' in modules.globals.execution_providers:
         return 1
-    return 8
+    if 'CUDAExecutionProvider' in modules.globals.execution_providers:
+        return 2
+    if 'OpenVINOExecutionProvider' in modules.globals.execution_providers:
+        return 1
+    
+    # For CPU execution, use most cores but leave some for system
+    return max(4, min(cpu_count - 2, 16))
 
 
 def limit_resources() -> None:
     # prevent tensorflow memory leak
-    gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        tensorflow.config.experimental.set_memory_growth(gpu, True)
+    if HAS_TENSORFLOW:
+        gpus = tensorflow.config.experimental.list_physical_devices('GPU')
+        for gpu in gpus:
+            tensorflow.config.experimental.set_memory_growth(gpu, True)
     # limit memory usage
     if modules.globals.max_memory:
         memory = modules.globals.max_memory * 1024 ** 3
-        if platform.system().lower() == 'darwin':
-            memory = modules.globals.max_memory * 1024 ** 6
         if platform.system().lower() == 'windows':
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -156,7 +189,7 @@ def limit_resources() -> None:
 
 
 def release_resources() -> None:
-    if 'CUDAExecutionProvider' in modules.globals.execution_providers:
+    if 'CUDAExecutionProvider' in modules.globals.execution_providers and HAS_TORCH:
         torch.cuda.empty_cache()
 
 
@@ -176,10 +209,16 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
         ui.update_status(message)
 
 def start() -> None:
+    """Start processing with performance monitoring."""
+    import time
+    
+    start_time = time.time()
+    
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_start():
             return
     update_status('Processing...')
+    
     # process image to image
     if has_image_extension(modules.globals.target_path):
         if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
@@ -193,34 +232,80 @@ def start() -> None:
             frame_processor.process_image(modules.globals.source_path, modules.globals.output_path, modules.globals.output_path)
             release_resources()
         if is_image(modules.globals.target_path):
-            update_status('Processing to image succeed!')
+            elapsed = time.time() - start_time
+            update_status(f'Processing to image succeed! (Time: {elapsed:.2f}s)')
         else:
             update_status('Processing to image failed!')
         return
+    
     # process image to videos
     if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
         return
 
-    if not modules.globals.map_faces:
-        update_status('Creating temp resources...')
-        create_temp(modules.globals.target_path)
-        update_status('Extracting frames...')
-        extract_frames(modules.globals.target_path)
-
-    temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        update_status('Progressing...', frame_processor.NAME)
-        frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
-        release_resources()
-    # handles fps
+    # Detect FPS early (needed by both pipelines)
     if modules.globals.keep_fps:
         update_status('Detecting fps...')
         fps = detect_fps(modules.globals.target_path)
-        update_status(f'Creating video with {fps} fps...')
-        create_video(modules.globals.target_path, fps)
     else:
-        update_status('Creating video with 30.0 fps...')
-        create_video(modules.globals.target_path)
+        fps = 30.0
+
+    video_created = False
+
+    # --- In-memory pipeline (non-map_faces only) ---
+    # Reads frames from FFmpeg pipe, processes in memory, encodes directly.
+    # Eliminates all per-frame PNG disk I/O for a major speed-up.
+    if not modules.globals.map_faces:
+        update_status(f'Processing video in-memory at {fps} fps...')
+        create_temp(modules.globals.target_path)
+
+        processing_start = time.time()
+        video_created = process_video_in_memory(
+            modules.globals.source_path,
+            modules.globals.target_path,
+            fps,
+        )
+        processing_time = time.time() - processing_start
+        release_resources()
+
+        if video_created:
+            update_status(f'In-memory processing + encoding completed in {processing_time:.2f}s')
+
+    # --- Disk-based fallback (required for map_faces, or if pipe failed) ---
+    if not video_created:
+        if not modules.globals.map_faces:
+            update_status('Falling back to disk-based processing...')
+
+        extraction_start = time.time()
+        create_temp(modules.globals.target_path)
+        update_status('Extracting frames...')
+        extract_frames(modules.globals.target_path)
+        extraction_time = time.time() - extraction_start
+
+        temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
+        total_frames = len(temp_frame_paths)
+        update_status(f'Processing {total_frames} frames with {modules.globals.execution_threads} threads...')
+
+        processing_start = time.time()
+        for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+            update_status('Progressing...', frame_processor.NAME)
+            frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
+            release_resources()
+        processing_time = time.time() - processing_start
+        fps_processing = total_frames / processing_time if processing_time > 0 else 0
+        update_status(f'Frame processing completed in {processing_time:.2f}s ({fps_processing:.2f} fps)')
+
+        encoding_start = time.time()
+        update_status(f'Creating video with {fps} fps...')
+        video_created = create_video(modules.globals.target_path, fps)
+        encoding_time = time.time() - encoding_start
+        if video_created:
+            update_status(f'Video encoding completed in {encoding_time:.2f}s')
+
+    if not video_created:
+        update_status('Video encoding failed. No temporary output video was created.')
+        clean_temp(modules.globals.target_path)
+        return
+    
     # handle audio
     if modules.globals.keep_audio:
         if modules.globals.keep_fps:
@@ -230,10 +315,13 @@ def start() -> None:
         restore_audio(modules.globals.target_path, modules.globals.output_path)
     else:
         move_temp(modules.globals.target_path, modules.globals.output_path)
+    
     # clean and validate
     clean_temp(modules.globals.target_path)
-    if is_video(modules.globals.target_path):
-        update_status('Processing to video succeed!')
+    
+    total_time = time.time() - start_time
+    if is_video(modules.globals.target_path) and modules.globals.output_path and os.path.isfile(modules.globals.output_path):
+        update_status(f'Video processing succeeded! Total time: {total_time:.2f}s')
     else:
         update_status('Processing to video failed!')
 
@@ -241,7 +329,8 @@ def start() -> None:
 def destroy(to_quit=True) -> None:
     if modules.globals.target_path:
         clean_temp(modules.globals.target_path)
-    if to_quit: quit()
+    if to_quit:
+        quit()
 
 
 def run() -> None:
@@ -251,6 +340,9 @@ def run() -> None:
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
             return
+    # Pre-load face analyser in main thread before GUI starts
+    #from modules.face_analyser import get_face_analyser
+    #get_face_analyser()
     limit_resources()
     if modules.globals.headless:
         start()
